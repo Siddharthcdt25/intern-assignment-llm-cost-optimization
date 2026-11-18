@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import json
-import uuid
 from dataclasses import dataclass
 
 from shared.billing import CostSession
-from shared.kb import expanded_help_center_blob, title_index
+from shared.kb import load_article
 from shared.llm import ChatMessage, LlmClient
 from shared.tools import format_thread, get_order, get_ticket
 
@@ -19,115 +18,115 @@ class TicketResolution:
 
 
 class SupportPipeline:
-    """Same product as Question 1 — triage, retrieve, compose, audit."""
+    """
+    Optimized four-node ShopAssist pipeline.
+
+    Triage   -> LLM-based decision
+    Retrieve -> Local knowledge-base retrieval
+    Compose  -> Local resolution construction
+    Audit    -> Local validation
+    """
 
     def __init__(self, session: CostSession | None = None):
         self.session = session or CostSession()
         self.llm = LlmClient(self.session)
-        self.help_center = expanded_help_center_blob()
 
     def handle_ticket(self, ticket_id: str) -> TicketResolution:
         ticket = get_ticket(ticket_id)
         order = get_order(ticket["order_id"])
-        thread = format_thread(ticket)
-        snapshot = json.dumps(order, indent=2)
 
+        thread = format_thread(ticket)
+        snapshot = json.dumps(order, separators=(",", ":"))
+
+        # Node 1: Triage — the only LLM call
         triage = self._triage(ticket_id, thread, snapshot)
-        retrieved = self._retrieve(triage, snapshot)
-        draft = self._compose(ticket_id, thread, snapshot, triage, retrieved)
-        final = self._audit(ticket_id, thread, snapshot, triage, retrieved, draft)
+
+        # Node 2: Retrieve — load the relevant KB article
+        retrieved = self._retrieve(triage)
+
+        # Node 3: Compose — construct the final resolution locally
+        draft = self._compose(triage, retrieved)
+
+        # Node 4: Audit — validate the final resolution
+        final = self._audit(draft, retrieved)
+
         parsed = parse_resolution(final)
-        return TicketResolution(parsed.action, parsed.kb_article)
+
+        return TicketResolution(
+            action=parsed.action,
+            kb_article=parsed.kb_article,
+        )
 
     def _triage(self, ticket_id: str, thread: str, snapshot: str) -> str:
         messages = [
             ChatMessage(
                 "system",
-                "\n".join(
-                    [
-                        f"trace-{uuid.uuid4()}",
-                        "Triage node: restate the ticket step by step and list candidate kb articles.",
-                        f"ARTICLE TITLES:\n{title_index(500)}",
-                        self.help_center[:120_000],
-                    ]
-                ),
+                "Triage the support request. Return JSON with "
+                "action and kb_article.",
             ),
             ChatMessage(
                 "user",
-                f"TICKET {ticket_id}\nTHREAD:\n{thread}\nORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
+                f"TICKET:{ticket_id}\n"
+                f"THREAD:{thread}\n"
+                f"ORDER_SNAPSHOT:{snapshot}\n"
+                "END_SNAPSHOT",
             ),
         ]
+
         return self.llm.chat("triage", messages)
 
-    def _retrieve(self, triage: str, snapshot: str) -> str:
-        messages = [
-            ChatMessage(
-                "system",
-                "Retrieve node: print full text of the eight most relevant help articles.",
-            ),
-            ChatMessage(
-                "user",
-                f"TRIAGE:\n{triage}\nORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-            ),
-        ]
-        return self.llm.chat("retrieve", messages)
+    def _retrieve(self, triage: str) -> str:
+        result = parse_resolution(triage)
+        article = load_article(result.kb_article)
 
-    def _compose(
-        self,
-        ticket_id: str,
-        thread: str,
-        snapshot: str,
-        triage: str,
-        retrieved: str,
-    ) -> str:
-        messages = [
-            ChatMessage(
-                "system",
-                "Compose node: full reasoning, then JSON with action, kb_article, customer_reply.",
-            ),
-            ChatMessage(
-                "user",
-                "\n\n".join(
-                    [
-                        f"TICKET {ticket_id}",
-                        f"THREAD:\n{thread}",
-                        f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-                        f"TRIAGE:\n{triage}",
-                        f"ARTICLES:\n{retrieved}",
-                        f"TRIAGE AGAIN:\n{triage}",
-                    ]
-                ),
-            ),
-        ]
-        return self.llm.chat("compose", messages)
+        if not article:
+            raise ValueError(
+                f"Knowledge-base article not found: {result.kb_article}"
+            )
 
-    def _audit(
-        self,
-        ticket_id: str,
-        thread: str,
-        snapshot: str,
-        triage: str,
-        retrieved: str,
-        draft: str,
-    ) -> str:
-        messages = [
-            ChatMessage(
-                "system",
-                "Audit node: double-check policy, restate ticket, rewrite JSON output.",
-            ),
-            ChatMessage(
-                "user",
-                "\n\n".join(
-                    [
-                        self.help_center[:80_000],
-                        f"TICKET {ticket_id}",
-                        f"THREAD:\n{thread}",
-                        f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-                        f"DRAFT:\n{draft}",
-                        f"TRIAGE:\n{triage}",
-                        f"ARTICLES:\n{retrieved}",
-                    ]
-                ),
-            ),
-        ]
-        return self.llm.chat("audit", messages)
+        return json.dumps(
+            {
+                "article_id": result.kb_article,
+                "article": article,
+            },
+            separators=(",", ":"),
+        )
+
+    def _compose(self, triage: str, retrieved: str) -> str:
+        triage_result = parse_resolution(triage)
+        policy = json.loads(retrieved)
+
+        if triage_result.kb_article != policy["article_id"]:
+            raise ValueError(
+                "Triage decision does not match the retrieved KB article."
+            )
+
+        # Build the final structured resolution without another LLM call.
+        return json.dumps(
+            {
+                "action": triage_result.action,
+                "kb_article": policy["article_id"],
+            },
+            separators=(",", ":"),
+        )
+
+    def _audit(self, draft: str, retrieved: str) -> str:
+        result = parse_resolution(draft)
+        policy = json.loads(retrieved)
+
+        valid_actions = {
+            "REFUND",
+            "REPLACE",
+            "SEND_ARTICLE",
+            "ESCALATE_TIER2",
+        }
+
+        if result.action not in valid_actions:
+            raise ValueError(f"Invalid action: {result.action}")
+
+        if result.kb_article != policy["article_id"]:
+            raise ValueError(
+                "Final resolution does not match the retrieved KB article."
+            )
+
+        return draft

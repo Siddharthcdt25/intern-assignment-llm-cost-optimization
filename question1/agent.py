@@ -1,12 +1,12 @@
+
 from __future__ import annotations
 
 import json
 import re
-import uuid
 from dataclasses import dataclass
 
 from shared.billing import CostSession
-from shared.kb import all_articles_blob
+from shared.kb import load_article
 from shared.llm import ChatMessage, LlmClient
 from shared.tools import format_thread, get_order, get_ticket
 
@@ -21,9 +21,12 @@ class TicketResolution:
 
 def parse_resolution(text: str) -> TicketResolution:
     m = re.search(r"\{[\s\S]*\}", text)
+
     if not m:
         raise ValueError(f"No JSON in model output:\n{text[:400]}")
+
     data = json.loads(m.group())
+
     return TicketResolution(
         action=str(data["action"]).upper(),
         kb_article=str(data["kb_article"]),
@@ -32,22 +35,42 @@ def parse_resolution(text: str) -> TicketResolution:
     )
 
 
-_FEW_SHOT = """
-Example ticket resolutions (format to copy):
+def select_relevant_article(order: dict) -> str:
+    """
+    Select the relevant help-center article using order attributes.
+    This avoids sending the entire knowledge base to the LLM.
+    """
 
-1. Unopened headphones, day 10 → {"action":"REFUND","kb_article":"returns-within-30-days"}
-2. Ebook, license shown → {"action":"SEND_ARTICLE","kb_article":"digital-license-no-refund"}
-3. Cracked custom mug → {"action":"ESCALATE_TIER2","kb_article":"custom-items-no-replace"}
-4. Cracked stock mug, day 2 → {"action":"REPLACE","kb_article":"damage-replacement-7-days"}
-"""
+    product_type = order.get("product_type", "").lower()
+
+    if product_type == "subscription":
+        return "subscription-cooling-off"
+
+    if product_type == "digital" or order.get("license_revealed"):
+        return "digital-license-no-refund"
+
+    if product_type == "custom" or order.get("customized"):
+        return "custom-items-no-replace"
+
+    if (
+        order.get("damage_reported")
+        and order.get("delivered_days_ago", 999) <= 7
+    ):
+        return "damage-replacement-7-days"
+
+    if (
+        product_type == "physical"
+        and order.get("delivered_days_ago", 999) <= 30
+    ):
+        return "returns-within-30-days"
+
+    return "returns-within-30-days"
 
 
 class SupportCopilot:
     """
-    ShopAssist Tier-1 copilot (baseline).
-
-    Given a support ticket + order snapshot, choose an action, cite the help-center
-    article, and draft the customer reply.
+    Optimized ShopAssist Tier-1 support copilot.
+    Uses one LLM call per ticket with a compact policy context.
     """
 
     def __init__(self, session: CostSession | None = None):
@@ -55,34 +78,42 @@ class SupportCopilot:
         self.llm = LlmClient(self.session)
 
     def build_messages(self, ticket_id: str) -> list[ChatMessage]:
+
         ticket = get_ticket(ticket_id)
         order = get_order(ticket["order_id"])
-        thread = format_thread(ticket)
-        snapshot = json.dumps(order, indent=2)
 
-        system = "\n\n".join(
-            [
-                f"Run id {uuid.uuid4()}",
-                "You are ShopAssist, the Tier-1 customer support copilot.",
-                _FEW_SHOT,
-                "HELP CENTER:",
-                all_articles_blob(),
-                (
-                    "Instructions: Think step by step. Write full reasoning, quote any article "
-                    "you rely on, then output JSON with action, kb_article, customer_reply."
-                ),
-            ]
+        thread = format_thread(ticket)
+        snapshot = json.dumps(order, separators=(",", ":"))
+
+        article_id = select_relevant_article(order)
+        article_content = load_article(article_id)
+
+        system = (
+            "You are ShopAssist, a Tier-1 customer support copilot.\n"
+            "Resolve the customer request using the supplied order facts "
+            "and relevant help-center policy.\n"
+            f"RELEVANT POLICY ({article_id}):\n"
+            f"{article_content}\n"
+            "Return only valid JSON with these fields: "
+            "action, kb_article, customer_reply."
         )
-        user = "\n\n".join(
-            [
-                f"TICKET_ID: {ticket_id}",
-                f"THREAD:\n{thread}",
-                f"ORDER_SNAPSHOT:\n{snapshot}\nEND_SNAPSHOT",
-            ]
+
+        user = (
+            f"TICKET_ID: {ticket_id}\n"
+            f"THREAD:\n{thread}\n"
+            f"ORDER_SNAPSHOT:\n{snapshot}\n"
+            "END_SNAPSHOT"
         )
-        return [ChatMessage("system", system), ChatMessage("user", user)]
+
+        return [
+            ChatMessage("system", system),
+            ChatMessage("user", user),
+        ]
 
     def handle_ticket(self, ticket_id: str) -> TicketResolution:
+
         messages = self.build_messages(ticket_id)
+
         completion = self.llm.chat("handle_ticket", messages)
+
         return parse_resolution(completion)
